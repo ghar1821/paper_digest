@@ -26,6 +26,7 @@ ARXIV_CATS = [
     ("cs.NE", 50),
     ("cs.CV", 80),
     ("cs.CL", 80),
+    ("cs.MA", 50),
 ]
 
 
