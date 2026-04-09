@@ -27,4 +27,4 @@ uv run convert.py --input paper.pdf --output-dir ./output
 
 - [uv](https://github.com/astral-sh/uv) for dependency management
 - [Ollama](https://ollama.com) running locally with `gemma4:26b` pulled
-- Output is written to `~/papers/digests/`
+- Output is written to `~/Documents/papers/digest/`

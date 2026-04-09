@@ -14,7 +14,7 @@ from convert import convert_pdf, download_arxiv_pdf, parse_arxiv_url
 
 # ── Config ──────────────────────────────────────────────────────────────────
 MODEL = "gemma4:26b"
-OUTPUT_DIR = Path.home() / "papers" / "digests"
+OUTPUT_DIR = Path.home() / "Documents" / "papers" / "digest"
 MAX_RESULTS = 10
 TODAY = datetime.today()
 DATE_STR = TODAY.strftime("%Y-%m-%d")
