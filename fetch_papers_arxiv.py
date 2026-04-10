@@ -14,10 +14,10 @@ from convert import convert_pdf, download_arxiv_pdf, parse_arxiv_url
 
 # ── Config ──────────────────────────────────────────────────────────────────
 MODEL = "gemma4:26b"
-OUTPUT_DIR = Path.home() / "Documents" / "papers" / "digest"
+OUTPUT_DIR = Path(__file__).parent / "output"
 MAX_RESULTS = 10
 TODAY = datetime.today()
-DATE_STR = TODAY.strftime("%Y-%m-%d")
+DATETIME_STR = TODAY.strftime("%Y-%m-%d_%H-%M")
 
 # ── arXiv categories to sweep ────────────────────────────────────────────────
 ARXIV_CATS = [
@@ -38,7 +38,23 @@ def fetch_arxiv(cat, max_results):
         f"&sortBy=submittedDate&sortOrder=descending"
         f"&max_results={max_results}"
     )
-    resp = requests.get(url, timeout=30)
+    last_err = None
+    for attempt in range(1, 6):
+        try:
+            resp = requests.get(url, timeout=60)
+            resp.raise_for_status()
+            break
+        except Exception as exc:
+            last_err = exc
+            print(
+                f"  Warning: fetch failed for {cat} (attempt {attempt}/5): {exc}",
+                flush=True,
+            )
+            time.sleep(2 * attempt)
+    else:
+        raise RuntimeError(
+            f"Failed to fetch arXiv:{cat} after 5 attempts"
+        ) from last_err
     ns = {"atom": "http://www.w3.org/2005/Atom"}
     root = ET.fromstring(resp.text)
     papers = []
@@ -75,7 +91,7 @@ def deduplicate(papers):
     return unique
 
 
-# ── Ask Qwen to filter and score ─────────────────────────────────────────────
+# ── Ask  to filter and score ─────────────────────────────────────────────
 def filter_and_score(papers):
     abstracts_text = ""
     for i, p in enumerate(papers):
@@ -172,7 +188,10 @@ Papers:
             return _parse_json_from_raw(raw)
         except Exception as exc:
             last_err = exc
-            print(f"  Warning: LLM response parse failed (attempt {attempt}/3): {exc}")
+            print(
+                f"  Warning: LLM response parse failed (attempt {attempt}/3): {exc}",
+                flush=True,
+            )
             # short backoff before retrying
             time.sleep(2 * attempt)
 
@@ -188,7 +207,7 @@ def format_digest(selected, papers):
     lines = [
         f"# 🧬 Paper Digest — {day_str}",
         f"*{len(papers)} papers reviewed · {len(selected)} included · "
-        f"Qwen3 14B · Generated 03:00*",
+        f"{MODEL} · Generated 03:00*",
         "",
         "---",
         "",
@@ -229,7 +248,7 @@ def format_digest(selected, papers):
             ]
 
     lines.append(
-        f"*{len(papers)} reviewed · {len(selected)} included · Qwen3 14B · {DATE_STR}*"
+        f"*{len(papers)} reviewed · {len(selected)} included · {MODEL} · {DATETIME_STR}*"
     )
     return "\n".join(lines)
 
@@ -238,59 +257,61 @@ def format_digest(selected, papers):
 def download_must_reads(selected, papers):
     must_reads = [s for s in selected if s["score"] >= 9]
     if not must_reads:
-        print("No must-read papers (score >= 9) to download.")
+        print("No must-read papers (score >= 9) to download.", flush=True)
         return
 
-    pdf_dir = OUTPUT_DIR / DATE_STR / "pdfs"
+    pdf_dir = OUTPUT_DIR / DATETIME_STR / "pdfs"
     pdf_dir.mkdir(parents=True, exist_ok=True)
-    print(f"Downloading {len(must_reads)} must-read paper(s) to {pdf_dir} ...")
+    print(
+        f"Downloading {len(must_reads)} must-read paper(s) to {pdf_dir} ...", flush=True
+    )
 
     # Load marker models once for all conversions
     from marker.converters.pdf import PdfConverter
     from marker.models import create_model_dict
     from marker.output import text_from_rendered
 
-    print("Loading marker models ...")
+    print("Loading marker models ...", flush=True)
     model_dict = create_model_dict()
 
     for s in must_reads:
         p = papers[s["index"]]
         arxiv_id = parse_arxiv_url(p["link"])
         if arxiv_id is None:
-            print(f"  Skipping (could not parse arXiv ID): {p['link']}")
+            print(f"  Skipping (could not parse arXiv ID): {p['link']}", flush=True)
             continue
-        print(f"  [{s['score']}/10] {p['title'][:80]}")
+        print(f"  [{s['score']}/10] {p['title'][:80]}", flush=True)
         try:
             pdf_path = download_arxiv_pdf(arxiv_id, pdf_dir)
             convert_pdf(pdf_path, pdf_dir, model_dict=model_dict)
         except Exception as exc:
-            print(f"    Warning: failed — {exc}")
+            print(f"    Warning: failed — {exc}", flush=True)
 
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    print("Fetching arXiv...")
+    print("Fetching arXiv...", flush=True)
     all_papers = []
     for cat, n in ARXIV_CATS:
-        print(f"  {cat} ({n})")
+        print(f"  {cat} ({n})", flush=True)
         all_papers.extend(fetch_arxiv(cat, n))
 
-    print(f"Deduplicating {len(all_papers)} papers...")
+    print(f"Deduplicating {len(all_papers)} papers...", flush=True)
     all_papers = deduplicate(all_papers)
-    print(f"  {len(all_papers)} unique papers")
+    print(f"  {len(all_papers)} unique papers", flush=True)
 
-    print("Asking Qwen to filter and score...")
+    print("Asking  to filter and score...", flush=True)
     result = filter_and_score(all_papers)
     selected = result["selected"]
 
-    print(f"  {len(selected)} papers selected")
+    print(f"  {len(selected)} papers selected", flush=True)
 
-    print("Writing digest...")
+    print("Writing digest...", flush=True)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = OUTPUT_DIR / f"digest-{DATE_STR}.md"
+    output_path = OUTPUT_DIR / f"digest-{DATETIME_STR}.md"
     digest = format_digest(selected, all_papers)
     output_path.write_text(digest)
-    print(f"  Written to {output_path}")
+    print(f"  Written to {output_path}", flush=True)
 
     download_must_reads(selected, all_papers)
 

@@ -1,23 +1,30 @@
 #!/usr/bin/env bash
 # Runs the weekly paper digest via uv.
-# Intended to be called by cron — logs to ~/Documents/papers/digest/logs/
+# Intended to be called by cron — logs to ~/Documents/papers/digests/logs/
 
 set -euo pipefail
 
-SCRIPT_DIR="$HOME/Documents/GitHub/paper_digest"
-LOG_DIR="$HOME/Documents/papers/digest/logs"
+SCRIPT_DIR="$HOME/projects/paper_digest"
+LOG_DIR="$SCRIPT_DIR/output/logs"
 mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/digest-$(date +%Y-%m-%d).log"
+LOG_FILE="$LOG_DIR/digest-$(date +%Y-%m-%d_%H-%M-%S).log"
 
 echo "=== paper_digest started at $(date) ===" >> "$LOG_FILE"
 
 # Launch Ollama if not already running, then wait for it to be ready
 if ! pgrep -x "ollama" > /dev/null; then
     echo "Starting Ollama..." >> "$LOG_FILE"
-    open -a Ollama >> "$LOG_FILE" 2>&1
-    sleep 10
+    ollama serve >> "$LOG_FILE" 2>&1 &
+    # Poll until the API is up (max 60s)
+    for i in $(seq 1 60); do
+        if curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; then
+            echo "Ollama ready after ${i}s" >> "$LOG_FILE"
+            break
+        fi
+        sleep 1
+    done
 fi
 
 cd "$SCRIPT_DIR"
-"$SCRIPT_DIR/.venv/bin/python" fetch_papers_arxiv.py >> "$LOG_FILE" 2>&1
+"$SCRIPT_DIR/.venv/bin/python" -u fetch_papers_arxiv.py >> "$LOG_FILE" 2>&1
 echo "=== paper_digest finished at $(date) ===" >> "$LOG_FILE"
