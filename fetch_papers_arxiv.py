@@ -102,58 +102,13 @@ def filter_and_score(papers):
             f"ABSTRACT: {p['abstract'][:500]}\n"
         )
 
-    prompt = f"""
-You are a research assistant for a computational biologist specialising in
-cytometry data analysis, single-cell genomics, and AI/ML in biomedical research.
-
-Her interests span two tracks:
-
-Track 1 — Biomedical research:
-Cytometry batch correction, single-cell foundation models, perturbation prediction,
-ODEs and AI model mechanistic interpretability in biology, spatial transcriptomics,
-multiomics data integration,
-agentic AI for biological data analysis and prediction.
-
-Track 2 — CS/AI horizon scanning:
-LLM systems, world models, AI metacognition, how to build and understand AI models
-better. No biomedical connection required — just substantive CS work.
-
-Here are {len(papers)} paper abstracts from arXiv (cs.LG, cs.AI, cs.NE, cs.CV, cs.CL).
-For each paper:
-1. Decide if it belongs to Track 1, Track 2, or should be EXCLUDED
-2. Exclude if: primary method is NMF/ICA/PCA/SVD/factor analysis with no neural
-   component, pure clinical study, GWAS/epidemiology, pure gaming/robotics,
-   stats department paper with statistical estimator as core contribution
-3. Score relevance 1-10 within its track (never include below 5)
-4. Flag AI slop if 3+ of these apply: vague unfalsifiable claim, benchmark
-   circularity, missing ablations, implausible scope, no author web presence,
-   superlative density without numbers, convenient self-serving benchmark,
-   LLM phrasing patterns, no reproducibility statement
-5. Write a 3-sentence summary: (1) what they built, (2) how, (3) key result
-6. Write 1-2 sentences on why this paper is in the digest
-
-Return ONLY valid JSON in this exact format — no prose, no markdown:
-{{
-  "selected": [
-    {{
-      "index": <original index>,
-      "track": "Track 1" or "Track 2",
-      "score": <1-10>,
-      "slop": true or false,
-      "vetted": "pass" or "marginal" or "fail",
-      "summary": "<3 sentences>",
-      "why": "<1-2 sentences>"
-    }}
-  ]
-}}
-
-Select the top {MAX_RESULTS} papers by score. Aim for roughly 7 Track 1
-and 3 Track 2 papers but let score decide. Never include score below 5.
-Never include vetted=fail papers.
-
-Papers:
-{abstracts_text}
-"""
+    prompt_template = (Path(__file__).parent / "prompt_filter_score.md").read_text()
+    prompt = (
+        prompt_template
+        .replace("{num_papers}", str(len(papers)))
+        .replace("{max_results}", str(MAX_RESULTS))
+        .replace("{abstracts_text}", abstracts_text)
+    )
 
     def _parse_json_from_raw(raw_text):
         # strip any markdown fences if model adds them
@@ -182,7 +137,7 @@ Papers:
             response = ollama.chat(
                 model=MODEL,
                 messages=[{"role": "user", "content": prompt}],
-                options={"num_ctx": 131072},
+                options={"num_ctx": 196608},
             )
             raw = (response or {}).get("message", {}).get("content", "")
             return _parse_json_from_raw(raw)
