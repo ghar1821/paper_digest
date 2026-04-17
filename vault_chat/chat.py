@@ -1,5 +1,6 @@
 """
-CLI chat tool that connects an Obsidian vault to a local Ollama model.
+CLI chat tool that connects an Obsidian vault to a local Ollama model
+using native tool calling.
 
 Configuration:
   MODEL      — Ollama model name to use
@@ -14,7 +15,33 @@ import ollama
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 MODEL = "gemma4:26b"
-VAULT_PATH = Path("~/vault").expanduser()
+VAULT_PATH = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else Path("~/vault").expanduser()
+
+# ── Tool definition ───────────────────────────────────────────────────────────
+
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": (
+                "Read the full contents of a file from the Obsidian vault. "
+                "Use this whenever you need the actual content of a note, "
+                "the glossary, or the reading list before answering."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {
+                        "type": "string",
+                        "description": "Relative path to the file within the vault, e.g. 'to-read.md' or 'notes/paper.md'",
+                    }
+                },
+                "required": ["path"],
+            },
+        },
+    }
+]
 
 # ── Vault helpers ─────────────────────────────────────────────────────────────
 
@@ -28,42 +55,32 @@ def build_file_index(vault: Path) -> str:
     return "\n".join(lines)
 
 
-def load_file(vault: Path, rel_path: str) -> str | None:
-    """Read a vault file by relative path. Returns None if not found."""
+def read_file(vault: Path, rel_path: str) -> str:
+    """Read a vault file by relative path. Returns an error string if not found."""
     target = (vault / rel_path).resolve()
     # Guard against path traversal outside the vault
     try:
         target.relative_to(vault.resolve())
     except ValueError:
-        return None
+        return f"[Error: '{rel_path}' is outside the vault]"
     if not target.exists() or not target.is_file():
-        return None
+        return f"[Error: file not found: '{rel_path}']"
     return target.read_text(encoding="utf-8")
 
 
-def load_system_prompt(vault: Path) -> str:
-    """Load vault/system/SKILL.md as the system prompt, or use a default."""
+def build_system_prompt(vault: Path) -> str:
+    """Load SKILL.md and append the file index so the model knows what exists."""
     skill_path = vault / "system" / "SKILL.md"
     if skill_path.exists():
-        return skill_path.read_text(encoding="utf-8")
-    return (
-        "You are a knowledgeable assistant with access to an Obsidian vault. "
-        "When you need to read a file to answer a question, output exactly:\n"
-        "  READ: path/to/file.md\n"
-        "on its own line. Once you have the information you need, answer directly."
-    )
+        base = skill_path.read_text(encoding="utf-8").rstrip()
+    else:
+        base = "You are a knowledgeable assistant with access to an Obsidian vault."
+
+    file_index = build_file_index(vault)
+    return f"{base}\n\n{file_index}"
 
 
 # ── Agentic loop ──────────────────────────────────────────────────────────────
-
-
-def parse_read_request(text: str) -> str | None:
-    """Return the path from the first 'READ: path' line found, or None."""
-    for line in text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("READ:"):
-            return stripped[len("READ:") :].strip()
-    return None
 
 
 def run_agentic_turn(
@@ -72,29 +89,37 @@ def run_agentic_turn(
     vault: Path,
 ) -> str:
     """
-    Send history to the model and handle READ: requests in a loop.
-    Returns the final model response (no READ: request present).
+    Send history to the model and execute any tool calls in a loop.
+    Returns the final plain-text response.
     """
     while True:
-        response = client.chat(model=MODEL, messages=history)
-        reply = response["message"]["content"]
+        response = client.chat(
+            model=MODEL,
+            messages=history,
+            tools=TOOLS,
+            format=None,
+        )
+        message = response["message"]
 
-        read_path = parse_read_request(reply)
-        if read_path is None:
-            # No file request — this is the final answer
+        # No tool call — this is the final answer
+        if not message.get("tool_calls"):
+            reply = message["content"]
             history.append({"role": "assistant", "content": reply})
             return reply
 
-        # Acknowledge the model's request and feed back the file contents
-        history.append({"role": "assistant", "content": reply})
+        # Append the assistant's tool-call message to history
+        history.append(message)
 
-        content = load_file(vault, read_path)
-        if content is None:
-            file_message = f"[File not found: {read_path}]"
-        else:
-            file_message = f"Contents of {read_path}:\n\n{content}"
+        # Execute each tool call and append the results
+        for tool_call in message["tool_calls"]:
+            fn = tool_call["function"]
+            if fn["name"] == "read_file":
+                path_arg = fn["arguments"].get("path", "")
+                result = read_file(vault, path_arg)
+            else:
+                result = f"[Error: unknown tool '{fn['name']}']"
 
-        history.append({"role": "user", "content": file_message})
+            history.append({"role": "tool", "content": result})
 
 
 # ── Main session loop ─────────────────────────────────────────────────────────
@@ -106,24 +131,9 @@ def main() -> None:
         sys.exit(1)
 
     client = ollama.Client()
+    system_prompt = build_system_prompt(VAULT_PATH)
 
-    system_prompt = load_system_prompt(VAULT_PATH)
-    file_index = build_file_index(VAULT_PATH)
-
-    # Conversation history shared across all turns in this session
     history: list[dict] = [{"role": "system", "content": system_prompt}]
-
-    # Prime the first user message with the file index so the model knows
-    # what is available without having to ask.
-    index_preamble = (
-        f"{file_index}\n\n"
-        "Use READ: <path> on its own line whenever you need to see a file's contents."
-    )
-    history.append({"role": "user", "content": index_preamble})
-
-    # Consume the index message silently (no user question yet)
-    response = client.chat(model=MODEL, messages=history)
-    history.append({"role": "assistant", "content": response["message"]["content"]})
 
     print(f"Vault chat ready. Model: {MODEL}  Vault: {VAULT_PATH}")
     print("Type your question and press Enter. Ctrl-C or Ctrl-D to quit.\n")
