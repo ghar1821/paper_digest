@@ -26,5 +26,5 @@ if ! pgrep -x "ollama" > /dev/null; then
 fi
 
 cd "$SCRIPT_DIR"
-"$SCRIPT_DIR/.venv/bin/python" -u fetch_papers_arxiv.py >> "$LOG_FILE" 2>&1
+"$SCRIPT_DIR/.venv/bin/python" -u -m digest.run >> "$LOG_FILE" 2>&1
 echo "=== paper_digest finished at $(date) ===" >> "$LOG_FILE"

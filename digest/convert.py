@@ -4,13 +4,12 @@ Convert a PDF (local file or arXiv URL) to Markdown with extracted images.
 Uses marker-pdf for high-quality scientific paper conversion.
 
 Usage:
-    uv run convert.py <pdf_path_or_arxiv_url> [--output-dir <dir>]
+    uv run -m digest.convert --input <pdf_path_or_arxiv_url> [--output-dir <dir>]
 
 Examples:
-    uv run convert.py paper.pdf
-    uv run convert.py https://arxiv.org/abs/2301.07041
-    uv run convert.py https://arxiv.org/pdf/2301.07041
-    uv run convert.py paper.pdf --output-dir ./output
+    uv run -m digest.convert --input paper.pdf
+    uv run -m digest.convert --input https://arxiv.org/abs/2301.07041
+    uv run -m digest.convert --input paper.pdf --output-dir ./output
 """
 
 import argparse
@@ -72,13 +71,11 @@ def convert_pdf(pdf_path: Path, output_dir: Path, model_dict=None) -> None:
 
     markdown_text, _, images = text_from_rendered(rendered)
 
-    # Write markdown file
     md_path = output_dir / f"{pdf_path.stem}.md"
     with open(md_path, "w", encoding="utf-8") as f:
         f.write(markdown_text)
     print(f"Markdown saved to: {md_path}")
 
-    # Write images
     if images:
         images_dir = output_dir / f"{pdf_path.stem}_images"
         images_dir.mkdir(exist_ok=True)
@@ -94,7 +91,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Convert a PDF (local or arXiv) to Markdown with images.",
     )
-    parser.add_argument("--input", help="Local PDF path or arXiv URL/ID")
+    parser.add_argument("--input", required=True, help="Local PDF path or arXiv URL/ID")
     parser.add_argument(
         "--output-dir",
         default=None,
@@ -104,7 +101,6 @@ def main() -> None:
 
     input_str = args.input
 
-    # Determine if input is a URL or local file
     if input_str.startswith("http://") or input_str.startswith("https://"):
         arxiv_id = parse_arxiv_url(input_str)
         if arxiv_id is None:
