@@ -5,7 +5,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$HOME/projects/paper_digest"
-LOG_DIR="$SCRIPT_DIR/output/logs"
+LOG_DIR="$HOME/Documents/papers/digest/logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/digest-$(date +%Y-%m-%d_%H-%M-%S).log"
 
