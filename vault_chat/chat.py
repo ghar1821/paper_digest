@@ -15,7 +15,11 @@ import ollama
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 MODEL = "gemma4:26b"
-VAULT_PATH = Path(sys.argv[1]).expanduser() if len(sys.argv) > 1 else Path("~/vault").expanduser()
+VAULT_PATH = (
+    Path(sys.argv[1]).expanduser()
+    if len(sys.argv) > 1
+    else Path("~/vault").expanduser()
+)
 
 # ── Tool definition ───────────────────────────────────────────────────────────
 
@@ -26,8 +30,10 @@ TOOLS = [
             "name": "read_file",
             "description": (
                 "Read the full contents of a file from the Obsidian vault. "
-                "Use this whenever you need the actual content of a note, "
-                "the glossary, or the reading list before answering."
+                "Use this whenever you need the actual content of a note, the glossary, "
+                "the reading list, common cross-paper themes, or any other vault file "
+                "before answering. Always read relevant files before answering — never "
+                "answer from memory alone."
             ),
             "parameters": {
                 "type": "object",
