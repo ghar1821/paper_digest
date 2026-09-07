@@ -50,12 +50,14 @@ Privacy model
 
 import fcntl
 import hashlib
+import os
 import re
 import threading
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
+from chromadb.config import Settings
 from langchain_chroma import Chroma
 from langchain_core.documents import Document
 
@@ -88,12 +90,18 @@ _write_lock_state = threading.local()
 @contextmanager
 def _kb_write_lock():
     """
-    Cross-process advisory lock serialising ChromaDB writes.
+    Cross-process advisory lock serialising direct writes to the index files.
 
-    The daemon, webapp, and CLI all open the same PersistentClient directory,
-    and Chroma's SQLite backend is not safe for concurrent multi-process
-    writers. Every write path takes this flock on <rag_dir>/.write.lock;
-    reads stay unlocked (SQLite WAL handles concurrent readers).
+    Narrower than it used to be. Normally the knowledge-base server owns the
+    index and serialises everything itself, so this lock has nothing to do.
+    It still matters on the direct path — one-shot `kb` commands opening the
+    directory themselves because the server is not running — where two of them
+    could otherwise write to the same SQLite file at once.
+
+    Reads stay unlocked. Note that WAL only ever covered half the store: the
+    chunk text and metadata live in SQLite, the vectors in a separate segment
+    it knows nothing about. Relying on that distinction is what produced stale
+    readers, and is why the server exists.
     """
     if getattr(_write_lock_state, "depth", 0):
         _write_lock_state.depth += 1
@@ -115,54 +123,72 @@ def _kb_write_lock():
             fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 
-def _is_stale_view_error(exc: Exception) -> bool:
-    """
-    Whether this failure is consistent with an out-of-date view of the index
-    rather than damage to it — i.e. worth reopening and retrying once.
-
-    Both signatures arise when another process rebuilt or rewrote the index
-    underneath this one: a deleted chunk id still referenced by this process's
-    view, or the whole collection replaced by `kb reindex`.
-    """
-    text = str(exc)
-    return "Error finding id" in text or ("does not exist" in text and "Collection" in text)
-
-
 def _diagnose_kb_error(exc: Exception, fallback_message: str) -> RAGError:
     """
     Map a raw ChromaDB failure to the most actionable error we can raise.
 
-    Two failure signatures get a specific diagnosis instead of a generic
-    RAGError, both raised as KBCorruptionError so the chat tools relay the
-    message verbatim and never retry (per the KBCorruptionError contract —
-    both describe persistent state a retry would only hide):
+    Three signatures get a specific diagnosis instead of a generic RAGError:
 
-    - "Error finding id": a stale HNSW reference to a deleted chunk — real
-      on-disk corruption; the fix is `kb reindex`.
-    - "Collection [...] does not exist": NOT corruption — `kb reindex` swapped
-      in a rebuilt collection (new UUID) while this process was running, so
-      the process-wide store singleton holds a handle to the deleted one.
-      The fix is simply restarting the process.
+    - The server not answering. Everything else is unreachable too, so say so
+      rather than letting a connection error surface as a search failure.
+
+    - "Error finding id": the index could not resolve a chunk id. This used to
+      be diagnosed as on-disk corruption, which was wrong — it was a process
+      holding a cached copy of the vector index while another process rewrote
+      it, and it went away the moment that reader was restarted. The server
+      owns the index now, so a reader cannot hold a stale copy at all, and a
+      one-shot command on the direct path opened the index moments ago. If it
+      still appears, the index genuinely cannot resolve its own ids, and a
+      rebuild is the answer.
+
+    - "Collection [...] does not exist": survives the move to a server. A
+      client resolves a collection to an id once, and `kb reindex` swaps in a
+      rebuilt collection with a new id, so a process that was already
+      connected still names the old one. Restarting it is still the fix.
     """
     text = str(exc)
+    if _looks_like_server_down(exc):
+        return RAGError(f"{_SERVER_DOWN_HELP}\n  ({exc})")
     if "Error finding id" in text:
         return KBCorruptionError(
-            "The knowledge-base search hit a chunk id that is no longer there. "
-            "This search was already retried once against a freshly reopened "
-            "index, so it is not simply a stale handle left over from another "
-            "process writing (the usual cause, which that retry fixes). "
-            "The index itself is likely damaged: run `uv run kb reindex` to "
-            "rebuild it from the chunk texts already stored — nothing is lost. "
-            "If even that cannot run, use `uv run kb reindex --from-storage`."
+            "The knowledge-base index could not resolve a chunk id it holds a "
+            "reference to. Run `uv run kb doctor` to check the index; if it "
+            "reports missing ids, `uv run kb reindex` rebuilds the vectors "
+            "from the chunk text already stored — nothing is lost. If even "
+            "that cannot run, use `uv run kb reindex --from-storage`."
         )
     if "does not exist" in text and "Collection" in text:
         return KBCorruptionError(
             "The knowledge-base collection was rebuilt (by `kb reindex`) while "
-            "this process was running, and reopening it did not help. Fix: "
-            "restart this process (the webapp or jarvis-sync) — "
-            "nothing is lost; the rebuilt knowledge base is intact on disk."
+            "this process was running, so it still refers to the collection "
+            "that was replaced. Fix: restart this process (the webapp or "
+            "jarvis-sync) — nothing is lost; the rebuilt knowledge base is "
+            "intact."
         )
     return RAGError(fallback_message)
+
+
+def _looks_like_server_down(exc: Exception) -> bool:
+    """
+    Whether this failure is the server being unreachable rather than a problem
+    with the data.
+
+    Matched on the exception text because the httpx/chromadb error types differ
+    by transport and version. The markers are deliberately specific: "connect"
+    on its own would also swallow "connection reset by peer", which is a
+    different fault and deserves its own message.
+    """
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in (
+            "connection refused",
+            "failed to connect",
+            "could not connect",
+            "cannot connect",
+            "max retries",
+        )
+    )
 
 
 # ── Singletons ────────────────────────────────────────────────────────────────
@@ -210,38 +236,115 @@ def _get_reranker() -> CrossEncoder | None:
     return _reranker
 
 
-def get_store(rag_dir: Path | None = None) -> Chroma:
-    """Return the process-wide Chroma vector store singleton."""
+def _chroma_settings() -> Settings:
+    """
+    Chroma client settings, with its usage reporting switched off.
+
+    Built fresh per client rather than shared: constructing an HttpClient
+    stamps the server transport into the Settings object it is handed, so a
+    reused instance would then tell a PersistentClient to go looking for a
+    server too — which is exactly the fallback path that must not do that.
+
+    Telemetry is a constructor argument rather than an environment variable,
+    which is why it lives here and not in jarvis/__init__.py. In the version
+    pinned today Chroma's reporting class is already a no-op stub, but the
+    default is True, so setting it stops an upgrade quietly re-enabling it.
+    """
+    return Settings(anonymized_telemetry=False)
+
+_SERVER_DOWN_HELP = (
+    "The knowledge-base server is not running.\n"
+    "  Start it with:  uv run kb server\n"
+    "  It needs to stay running (tmux or its own terminal), like jarvis-sync."
+)
+
+
+def _server_client(port: int):
+    """
+    Connect to the knowledge-base server, or raise if it is not answering.
+
+    Bound to 127.0.0.1 by both sides: the index holds private note text and
+    Chroma's server has no authentication, so reachability from outside this
+    machine is the thing that must never become configurable.
+    """
+    import chromadb
+
+    client = chromadb.HttpClient(host="127.0.0.1", port=port, settings=_chroma_settings())
+    client.heartbeat()  # cheap round-trip; raises when nothing is listening
+    return client
+
+
+# Set once by the entry points that are one-shot commands rather than
+# long-lived services (the kb CLI, run-digest). A flag rather than an argument
+# threaded through every call site: get_store() is called from a dozen places
+# per command, and one missed kwarg would mean a command that dies whenever
+# the server is down — precisely the case the fallback exists for.
+_allow_direct = False
+
+
+def allow_direct_index_access() -> None:
+    """
+    Let this process open the index files itself if the server is not running.
+
+    Only for commands that exit in seconds. A long-lived process must never
+    call this: holding the index open across another process's write is the
+    fault the server was introduced to remove.
+    """
+    global _allow_direct
+    _allow_direct = True
+
+
+def get_store(rag_dir: Path | None = None, allow_direct: bool = False) -> Chroma:
+    """
+    Return the process-wide Chroma vector store singleton.
+
+    One process owns the index — the server started by `uv run kb server` —
+    and everything else talks to it. That is what stops a long-lived reader
+    holding a cached copy of the vector index while another process rewrites
+    it underneath (see docs/DESIGN.md, "Who owns the index").
+
+    allow_direct=True opens the directory in-process instead when the server
+    is not running. It is for one-shot `kb` commands only: they exit in
+    seconds, so they cannot go stale, and it keeps `kb doctor` working at
+    exactly the moment the server is the thing that is broken. Long-lived
+    readers (webapp, sync daemon) leave it False and fail loudly instead.
+    """
     global _store
     if _store is None:
         d = rag_dir or get_config().rag_dir
         d.mkdir(parents=True, exist_ok=True)
+        # The index holds the full text of private notes, so it gets the same
+        # owner-only treatment as sessions and drafts. chmod every time rather
+        # than only on create: an index that predates this is fixed on open.
+        try:
+            os.chmod(d, 0o700)
+        except OSError as exc:
+            # Someone else owning the directory shouldn't stop jarvis working,
+            # but it does mean private note text is readable by whoever can
+            # reach it — worth a line rather than a silent pass.
+            log.warning("could not restrict %s to owner-only access: %s", d, exc)
         cfg = get_config()
-        _store = Chroma(
-            collection_name=COLLECTION_NAME,
-            embedding_function=_get_embeddings(),
-            persist_directory=str(d),
-            collection_metadata={
+        shared: dict = {
+            "collection_name": COLLECTION_NAME,
+            "embedding_function": _get_embeddings(),
+            "collection_metadata": {
                 "embed_model": cfg.embed_model,
                 "query_prefix": cfg.query_prefix,
             },
-        )
+        }
+        try:
+            _store = Chroma(client=_server_client(cfg.server_port), **shared)
+        except Exception as exc:
+            if not (allow_direct or _allow_direct):
+                raise RAGError(f"{_SERVER_DOWN_HELP}\n  ({exc})") from exc
+            # Fall back to owning the files ourselves for the length of this
+            # command. Safe only because the server is demonstrably not up:
+            # two writers on one SQLite file is what the write lock guards.
+            _store = Chroma(
+                client_settings=_chroma_settings(), persist_directory=str(d), **shared
+            )
         _check_embedding_model_matches(_store, cfg.embed_model)
     return _store
-
-
-def reset_store() -> None:
-    """
-    Drop the process-wide store handle so the next get_store() re-opens it.
-
-    Needed because a long-running reader (the webapp, a chat session) holds an
-    open view of the index, and another process — usually the sync daemon —
-    writes to it on a schedule. After such a write the reader's view refers to
-    chunk ids that no longer exist, and a search fails with "Error finding id".
-    Nothing is damaged; the handle is simply out of date.
-    """
-    global _store
-    _store = None
 
 
 def _check_embedding_model_matches(store: Chroma, embed_model: str) -> None:
@@ -995,20 +1098,11 @@ def search(
     try:
         candidates = run(s)
     except Exception as exc:
-        # A long-running reader (webapp, chat session) holds an open view of
-        # the index while the sync daemon writes to it on a schedule. After a
-        # write, the reader's view names ids that no longer exist and the
-        # search fails — but nothing is damaged, the handle is just out of
-        # date. Reopen and try once more. Only a second failure is treated as
-        # real corruption, so a persistent problem still surfaces rather than
-        # being retried away.
-        if store is not None or not _is_stale_view_error(exc):
-            raise _diagnose_kb_error(exc, f"Search failed: {exc}") from exc
-        reset_store()
-        try:
-            candidates = run(get_store())
-        except Exception as retry_exc:
-            raise _diagnose_kb_error(retry_exc, f"Search failed: {retry_exc}") from retry_exc
+        # No reopen-and-retry here any more. It existed because a reader could
+        # hold a cached copy of the vector index that another process had
+        # rewritten, and the retry never actually ran (every caller passes
+        # store=). The server owns the index now, so that state cannot arise.
+        raise _diagnose_kb_error(exc, f"Search failed: {exc}") from exc
 
     if reranker is not None and len(candidates) > n_results:
         scores = reranker.predict([(query, doc.page_content) for doc in candidates])
@@ -1061,9 +1155,10 @@ def search_with_privacy_check(
                          doc_type=doc_type, store=s, **filters)
         try:
             # A cheap existence probe — order doesn't matter, so skip re-ranking.
-            # The retrieved private document stays in local process memory only;
-            # nothing beyond len(...) is used, and the probe runs before any
-            # cloud request, so private content cannot leak through this path.
+            # The retrieved private document never leaves this machine: it is
+            # read from the local knowledge-base server over loopback, nothing
+            # beyond len(...) is used, and the probe runs before any cloud
+            # request — so private content cannot leak through this path.
             private_check = search(query, n_results=1, visibility="private",
                                    doc_type=doc_type, store=s, rerank=False, **filters)
             has_private = len(private_check) > 0

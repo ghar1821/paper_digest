@@ -149,7 +149,7 @@ All require `uv run` prefix unless the venv is activated (`source .venv/bin/acti
 | Path | Contents |
 |---|---|
 | `~/.jarvis/config.toml` | User configuration (mode 0600 after any settings write-back) |
-| `~/.jarvis/rag/` | ChromaDB persistent store (+ `.write.lock` for cross-process writes) |
+| `~/.jarvis/rag/` | ChromaDB persistent store, owned by `kb server` (+ `.write.lock`, which now only guards direct access while that server is stopped). Dir 0700 — it holds the full text of private notes |
 | `~/.jarvis/state/sync_status.json` | `jarvis-sync` daemon/job status (read by `kb sync-status`) |
 | `~/.jarvis/sessions/` | Persistent chat sessions, one JSON file each (dir 0700, files 0600) |
 | `~/.jarvis/prompts/` | The user's editable copies of the three prompts, seeded from the shipped defaults on first use (files 0600 not enforced — they hold no secrets) |
@@ -439,13 +439,35 @@ Files under top-level `private_vault_dirs` folders → `"private"`. All papers �
 | `refresh_vault(vault_root)` | Incremental sync of vault `.md` files (add / update / delete, plus a visibility re-check on unchanged notes); returns `(added, updated, deleted)` |
 | `find_pdf_notes()` / `reclassify_notes_as_papers(sources)` | `kb doctor` migration helpers: find legacy `doc_type="note"` chunks with a `.pdf` `file_path`, and flip public ones to `doc_type="paper"` in place |
 
-**Cross-process write lock (`_kb_write_lock`).** The daemon, webapp, and CLI
-all open the same ChromaDB `PersistentClient` directory, and Chroma's SQLite
-backend isn't safe for concurrent multi-process writers. Every write path
-takes an advisory `flock` on `<rag_dir>/.write.lock`, re-entrant per thread so
-a composite operation like `refresh_vault` → `add_texts` doesn't
-self-deadlock. Reads stay unlocked — SQLite WAL handles concurrent readers on
-its own.
+**Who owns the index.** One process does: the server started by `uv run kb
+server` (`chroma run`, bound to 127.0.0.1). The webapp and `jarvis-sync`
+connect to it over loopback and refuse to start without it, naming the command
+to run. One-shot `kb` commands call `allow_direct_index_access()` in `main()`,
+which lets them open the index files themselves when the server is down —
+safe because they exit in seconds, and it keeps `kb doctor` usable at exactly
+the moment the server is the broken thing.
+
+This replaced every process opening its own `PersistentClient`. That model had
+a fault that looked like corruption and wasn't: the chunk text and metadata
+live in SQLite, where WAL gives readers a consistent view, but the vectors
+live in a separate segment WAL knows nothing about, cached in the process and
+never revalidated. When the daemon rewrote a changed note (delete + re-add),
+a long-lived reader's cached segment still listed the deleted ids, and the
+next filtered query failed with `"Error finding id"`. Worse was the quiet
+half: a reader that didn't happen to touch a deleted id simply searched an
+out-of-date index, so freshly edited notes were unfindable until the process
+restarted, with no error at all.
+
+**Cross-process write lock (`_kb_write_lock`).** Narrower than it used to be.
+The server serialises everything that goes through it, so this advisory `flock`
+on `<rag_dir>/.write.lock` now only covers the direct path — two one-shot `kb`
+commands writing to the same SQLite file while the server is down. Still
+re-entrant per thread so a composite operation like `refresh_vault` →
+`add_texts` doesn't self-deadlock.
+
+**Permissions.** `rag_dir` is created (and chmod'ed on every open) `0700`. The
+index holds the full text of private notes, so it gets the same owner-only
+treatment as sessions and drafts.
 
 ### Staged writes — all-or-nothing ingest
 
@@ -631,23 +653,35 @@ mean thousands of forward passes. So the cheap index narrows the corpus to
 This is also why the cross-encoder is unaffected by a damaged vector index —
 it consumes `page_content`, the chunk text, and never reads a vector.
 
-**4. Stale views, then corruption.** `"Error finding id"` — a reference to a
-chunk id that's no longer there — has two very different causes, and they
-must not be reported the same way. The common one isn't damage at all: a
-long-running reader (the webapp, a chat session) holds an open view of the
-index while the sync daemon writes to it on a schedule, so after an ingest
-the reader's view names ids that have gone. `search()` handles this by
-calling `reset_store()` and retrying **once** against a reopened handle. Only
-a second failure is diagnosed as `KBCorruptionError`, and its message says so
-explicitly — "already retried once against a freshly reopened index" —
-before naming `uv run kb reindex`. The single bounded retry is the point: it
-fixes the stale-view case without hiding a persistent one. A caller that
-passes `store=` explicitly is never retried, since it owns that handle. `uv
-run kb doctor` diagnoses this proactively (open store → count →
-search-probe) without waiting for a real query to hit it. On a badly
-corrupted store, even `count()` can hard-segfault the process — a Rust-side
-ChromaDB crash, uncatchable in Python — so `kb doctor` dying abruptly is
-itself the diagnosis, not a bug in the doctor command.
+**4. When retrieval fails.** `_diagnose_kb_error()` maps three ChromaDB
+signatures to something actionable rather than a generic `RAGError` the model
+would paraphrase into noise:
+
+- **The server isn't answering** — everything else is unreachable too, so the
+  message names `uv run kb server` rather than describing a search failure.
+- **`"Error finding id"`** — the index can't resolve an id it references.
+  This used to be diagnosed as on-disk corruption; that was wrong. It was the
+  stale-cache fault described under "Who owns the index", which no rebuild
+  could fix and a restart always did. With the server owning the index a
+  reader can't hold a stale copy, so the remaining cases are worth reporting:
+  `kb doctor` checks, `kb reindex` rebuilds the vectors from stored text.
+- **`"Collection [...] does not exist"`** — survives the move to a server. A
+  client resolves a collection to an id once, and `kb reindex` swaps in a
+  rebuilt collection with a new id, so anything already connected still names
+  the replaced one. Restarting that process is the fix, and `kb reindex` says
+  so when it finishes.
+
+There is deliberately **no reopen-and-retry** here. The previous one was
+unreachable in production — every caller passed `store=`, which disarmed it —
+while its message told the user a retry had already happened and the index was
+therefore damaged. That sent people to rebuild a healthy index.
+
+`uv run kb doctor` diagnoses proactively (open store → count → search-probe)
+and reports whether it reached the index through the server or directly, which
+is the first thing worth knowing when chat searches fail but CLI ones don't.
+On a badly corrupted store even `count()` can hard-segfault the process — a
+Rust-side ChromaDB crash, uncatchable in Python — so `kb doctor` dying
+abruptly is itself the diagnosis, not a bug in the doctor command.
 
 **Legacy PDF-note migration.** Once the store is confirmed healthy, `kb
 doctor` also checks for `doc_type="note"` chunks whose `file_path` is a local
@@ -2074,6 +2108,27 @@ deletion gate and `PrivacyError` stops don't rely on the model behaving.
 
 **Network hardening.** `TrustedHostMiddleware` rejects non-localhost Host
 headers, a DNS-rebinding defence, and the server binds to 127.0.0.1 only.
+
+Two loopback services now, not one: the webapp on 8080 and the knowledge-base
+server on 8321. The Chroma server has no authentication and no Host-header
+check of its own — its protection is that it is bound to 127.0.0.1 (never
+configurable, which is why there is no `server_host` key) and that Chroma's
+CORS default is closed, so browser JavaScript cannot read it. A token was
+considered and rejected: it would be inconsistent with the webapp beside it,
+which is equally unauthenticated and can read private notes through the chat,
+and anything running as the user could read the token out of `config.toml`
+anyway. The change that actually improved this posture was tightening
+`rag_dir` to 0700 — the index had been world-readable, so any account on the
+machine could already read every private note straight off disk.
+
+**Telemetry is off, deliberately and in one place.** `jarvis/__init__.py` sets
+`HF_HUB_DISABLE_TELEMETRY` and pins LangSmith tracing off before any library
+is imported (HuggingFace reads its variable at import time), and Chroma
+clients are built with `anonymized_telemetry=False` — that one is a
+constructor argument, not an environment variable. Chroma's reporting class is
+a no-op stub in the pinned version, but the default is `True`, so this stops
+an upgrade quietly re-enabling it. Same rule as declining OpenRouter's
+leaderboard headers: no usage reporting, by default, anywhere.
 Session ids from the network are validated (`[0-9a-z-]{1,64}`) before any
 file path construction, blocking traversal. Draft ids and filenames from the
 LLM get the same treatment — separator/traversal rejection plus resolved-path

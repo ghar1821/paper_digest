@@ -35,7 +35,33 @@ def main() -> None:
 
     print("Jarvis configuration" + format_describe() + "\n")
 
+    # Check the knowledge-base server before uvicorn takes over the terminal.
+    # The webapp is a long-lived reader, so it must never fall back to opening
+    # the index files itself — that is the fault the server exists to remove.
+    # Failing here, with the command to run, beats a stack trace on the first
+    # search half an hour into a conversation.
+    _require_kb_server()
+
     # A backend change needs the process restarted to be picked up. Static
     # files are served from disk on every request, so those only ever need a
     # browser reload.
     uvicorn.run("jarvis.webapp.app:app", host="127.0.0.1", port=8080)
+
+
+def _require_kb_server() -> None:
+    """Exit with the fix if the knowledge-base server is not answering."""
+    import sys
+
+    from jarvis.core.config import get_config
+    from jarvis.kb.store import _server_client
+
+    try:
+        _server_client(get_config().server_port)
+    except Exception as exc:
+        print(
+            "\n✗ The knowledge-base server is not running, and the webapp needs it.\n"
+            "  Start it in another terminal (or tmux):  uv run kb server\n"
+            f"  ({exc})",
+            file=sys.stderr,
+        )
+        sys.exit(1)

@@ -249,3 +249,60 @@ def test_check_legacy_pdf_notes_no_op_when_none_found(store, capsys):
     """No legacy PDF notes in the store — nothing is printed, no prompt shown."""
     _check_legacy_pdf_notes(store)
     assert capsys.readouterr().out == ""
+
+
+# ── The knowledge-base server ──────────────────────────────────────────────────
+
+
+def test_doctor_says_when_the_server_is_not_running(monkeypatch, capsys):
+    """
+    "Is the server up?" is the first question when chat searches fail but the
+    CLI is fine — they are different processes reaching the same data by
+    different routes, and only one of them needs the server.
+    """
+    monkeypatch.setattr(
+        cli, "_run_doctor_probe",
+        lambda: {"opened": True, "count": 5, "search_ok": True, "error": None,
+                 "via_server": False},
+    )
+    monkeypatch.setattr(cli, "_check_legacy_pdf_notes", lambda store: None)
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda *a, **k: None)
+
+    cli.cmd_doctor()
+
+    out = capsys.readouterr().out
+    assert "server is NOT running" in out
+    assert "uv run kb server" in out
+
+
+def test_doctor_confirms_the_server_when_it_is_up(monkeypatch, capsys):
+    monkeypatch.setattr(
+        cli, "_run_doctor_probe",
+        lambda: {"opened": True, "count": 5, "search_ok": True, "error": None,
+                 "via_server": True},
+    )
+    monkeypatch.setattr(cli, "_check_legacy_pdf_notes", lambda store: None)
+    monkeypatch.setattr("jarvis.kb.store.get_store", lambda *a, **k: None)
+
+    cli.cmd_doctor()
+
+    out = capsys.readouterr().out
+    assert "server is running" in out
+    assert "NOT running" not in out
+
+
+def test_reindex_from_storage_refuses_while_the_server_holds_the_index(monkeypatch, capsys):
+    """
+    --from-storage reads chroma.sqlite3 with raw SQL. Doing that behind the
+    server's back would race it on the same file, so it stops with the fix
+    rather than producing a confusing failure deeper down.
+    """
+    import argparse
+
+    monkeypatch.setattr("jarvis.kb.store._server_client", lambda port: object())
+
+    with pytest.raises(SystemExit) as caught:
+        cli.cmd_reindex(argparse.Namespace(from_storage=True))
+
+    assert caught.value.code == 1
+    assert "Stop it first" in capsys.readouterr().err

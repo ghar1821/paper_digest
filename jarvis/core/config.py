@@ -38,6 +38,7 @@ Example ~/.jarvis/config.toml:
     figure_max_per_doc = 20
     figure_min_pixels = 40000
     hybrid = true
+    server_port = 8321           # `uv run kb server` listens here, on 127.0.0.1
 
     [chat]
     provider = "ollama"          # "ollama" | "anthropic" | "openrouter"
@@ -158,6 +159,10 @@ class Config:
     # Hybrid dense+BM25 retrieval fused by reciprocal-rank fusion; false
     # reproduces the pre-hybrid dense-only pipeline exactly.
     hybrid: bool = True
+    # Port the knowledge-base server listens on (`uv run kb server`). It always
+    # binds 127.0.0.1 — the host is deliberately not configurable, because the
+    # index holds private note text and Chroma's server has no authentication.
+    server_port: int = 8321
 
     # ── Chat / LLM provider ──────────────────────────────────────────────────
     # "ollama" | "anthropic" | "openrouter", optionally "<provider>:<model>"
@@ -282,6 +287,8 @@ def load_config(config_file: Path = CONFIG_FILE) -> Config:
             cfg.figure_min_pixels = int(r["figure_min_pixels"])
         if "hybrid" in r:
             cfg.hybrid = bool(r["hybrid"])
+        if "server_port" in r:
+            cfg.server_port = int(r["server_port"])
 
         c = data.get("chat", {})
         if "provider" in c:
@@ -543,6 +550,7 @@ def describe(cfg: "Config | None" = None) -> list[dict]:
             ("vault_path", cfg.vault_path),
             ("private_vault_dirs", cfg.private_vault_dirs),
             ("rag_dir", cfg.rag_dir),
+            ("server_port", f"{cfg.server_port} (127.0.0.1 only)"),
             ("embed_model", cfg.embed_model),
             ("rerank_model", cfg.rerank_model),
             ("hybrid", cfg.hybrid),

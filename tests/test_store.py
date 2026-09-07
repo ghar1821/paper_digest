@@ -1496,79 +1496,115 @@ def test_metadata_key_and_value_counts_expose_the_user_ontology(store, tmp_path)
     assert set(statuses) == {"rejected"}
 
 
-# ── A stale view is not corruption ─────────────────────────────────────────────
+# ── Who owns the index ─────────────────────────────────────────────────────────
+#
+# The knowledge-base server owns the index; everything else connects to it.
+# These cover the two things that decision has to get right: a long-lived
+# process must refuse to run without the server rather than quietly opening
+# the files itself, and a one-shot command must still work when it is down.
 
-def test_search_reopens_and_retries_once_on_a_stale_view(monkeypatch, store):
+
+def test_get_store_refuses_to_open_directly_when_the_server_is_down(monkeypatch, tmp_path):
     """
-    The case that misdiagnosed itself in practice: a long-running reader (the
-    webapp) holds an open view of the index while the sync daemon writes to it
-    on a schedule. After a write the reader's view names ids that no longer
-    exist and the search fails — but nothing is damaged. Reopening and trying
-    once fixes it, so the user should never see a "corrupted, run reindex"
-    message for what a reopen resolves.
-    """
-    from jarvis.kb import store as store_module
-
-    add_texts(content="A document about wombat burrows.", doc_type="note",
-              visibility="public", source="stale-view", store=store)
-
-    calls = {"n": 0}
-    real_hybrid = store_module._hybrid_search
-
-    def flaky_hybrid(query, fetch_k, filter_dict, active_store):
-        calls["n"] += 1
-        if calls["n"] == 1:
-            raise RuntimeError("Error executing plan: Internal error: Error finding id")
-        return real_hybrid(query, fetch_k, filter_dict, active_store)
-
-    monkeypatch.setattr(store_module, "_hybrid_search", flaky_hybrid)
-    monkeypatch.setattr(store_module, "get_store", lambda: store)
-
-    # store= is omitted deliberately: the retry path only applies to the
-    # singleton, which is what a long-running process actually uses.
-    results = store_module.search("wombat burrows", n_results=3)
-
-    assert calls["n"] == 2, "the search should have been retried against a reopened handle"
-    assert results, "the retry should have returned the document"
-
-
-def test_a_persistent_stale_id_is_still_reported_as_corruption(monkeypatch, store):
-    """
-    The retry must not hide a real problem: when reopening does not help, the
-    second failure is diagnosed as corruption with the rebuild command.
+    The webapp and the sync daemon must fail loudly, naming the fix. Falling
+    back to opening the files would recreate the bug the server exists to
+    remove: a long-lived reader caching a copy of the vector index while
+    another process rewrites it.
     """
     from jarvis.kb import store as store_module
 
-    def always_broken(query, fetch_k, filter_dict, active_store):
-        raise RuntimeError("Error executing plan: Internal error: Error finding id")
+    monkeypatch.setattr(store_module, "_store", None)
+    monkeypatch.setattr(store_module, "get_config", lambda: Config(rag_dir=tmp_path))
 
-    monkeypatch.setattr(store_module, "_hybrid_search", always_broken)
-    monkeypatch.setattr(store_module, "get_store", lambda: store)
+    def no_server(port):
+        raise ConnectionError("connection refused")
 
-    with pytest.raises(KBCorruptionError) as caught:
-        store_module.search("anything", n_results=3)
+    monkeypatch.setattr(store_module, "_server_client", no_server)
 
-    message = str(caught.value)
-    assert "retried once" in message
-    assert "kb reindex" in message
+    with pytest.raises(RAGError, match="uv run kb server"):
+        store_module.get_store()
 
 
-def test_an_explicit_store_argument_is_never_retried(monkeypatch, store):
+def test_get_store_falls_back_to_the_files_for_one_shot_commands(monkeypatch, tmp_path):
     """
-    A caller passing store= owns that handle — tests and one-shot scripts —
-    so silently swapping it for the singleton would be wrong.
+    `kb doctor` and friends have to work when the server is the broken thing,
+    so they opt into opening the directory themselves. Safe because they exit
+    in seconds — a process that short-lived cannot go stale.
     """
     from jarvis.kb import store as store_module
 
-    calls = {"n": 0}
+    monkeypatch.setattr(store_module, "_store", None)
+    monkeypatch.setattr(store_module, "get_config", lambda: Config(rag_dir=tmp_path))
 
-    def always_broken(query, fetch_k, filter_dict, active_store):
-        calls["n"] += 1
-        raise RuntimeError("Error executing plan: Internal error: Error finding id")
+    def no_server(port):
+        raise ConnectionError("connection refused")
 
-    monkeypatch.setattr(store_module, "_hybrid_search", always_broken)
+    monkeypatch.setattr(store_module, "_server_client", no_server)
 
-    with pytest.raises(KBCorruptionError):
-        store_module.search("anything", n_results=3, store=store)
+    opened = store_module.get_store(allow_direct=True)
+    assert opened.add_documents is not None  # a usable store, not an error
+    store_module._store = None
 
-    assert calls["n"] == 1
+
+def test_the_index_directory_is_owner_only(monkeypatch, tmp_path):
+    """
+    The index holds the full text of private notes, so it gets the same 0700
+    treatment as sessions and drafts. Applied on every open, not just at
+    creation, so an index that predates this is fixed by using it.
+    """
+    import os
+    import stat
+
+    from jarvis.kb import store as store_module
+
+    rag_dir = tmp_path / "rag"
+    rag_dir.mkdir()
+    os.chmod(rag_dir, 0o755)
+
+    monkeypatch.setattr(store_module, "_store", None)
+    monkeypatch.setattr(store_module, "get_config", lambda: Config(rag_dir=rag_dir))
+    monkeypatch.setattr(store_module, "_server_client",
+                        lambda port: (_ for _ in ()).throw(ConnectionError("connection refused")))
+
+    store_module.get_store(allow_direct=True)
+    store_module._store = None
+
+    assert stat.S_IMODE(rag_dir.stat().st_mode) == 0o700
+
+
+def test_a_connection_reset_is_not_reported_as_a_stopped_server(store, monkeypatch):
+    """
+    The server-down message names a fix ("start it"), so it must not swallow
+    unrelated connection failures. "connection reset by peer" contains the
+    substring "connect" — matching on that alone would misdiagnose it.
+    """
+    monkeypatch.setattr("jarvis.kb.store.get_config", lambda: Config(hybrid=False))
+
+    def broken_similarity_search(*args, **kwargs):
+        raise Exception("connection reset by peer")
+
+    monkeypatch.setattr(store, "similarity_search", broken_similarity_search)
+
+    with pytest.raises(RAGError) as caught:
+        search("anything", store=store, rerank=False)
+    assert "uv run kb server" not in str(caught.value)
+
+
+def test_telemetry_is_disabled_before_any_library_is_imported():
+    """
+    Importing jarvis must switch off third-party reporting. HuggingFace reads
+    its variable at import time, so setting it later would be too late.
+    """
+    import os
+
+    import jarvis  # noqa: F401  (the import is the thing under test)
+
+    assert os.environ["HF_HUB_DISABLE_TELEMETRY"] == "1"
+    assert os.environ["LANGSMITH_TRACING"] == "false"
+
+
+def test_the_chroma_client_is_built_with_telemetry_off():
+    """Chroma's knob is a constructor argument, not an environment variable."""
+    from jarvis.kb.store import _chroma_settings
+
+    assert _chroma_settings().anonymized_telemetry is False

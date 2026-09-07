@@ -2,6 +2,20 @@
 
 ### NEW FUNCTIONALITY
 
+- Added `uv run kb server`, which now owns and manages the knowledge base.
+  It must be run alongside `jarvis-sync` and the webapp.
+  The `kb` commands do not need it as they read the index directly from the database.
+  This fixes the bug where chat searches failing with "the index is likely damaged: run
+  `uv run kb reindex`" when nothing was damaged. Every process opened
+  its own copy of the knowledge base without any synchronisation process
+  which causes stale index in the copy kept by the webapp when `jarvis-sync` rewrote
+  them (PR #4).
+
+- Turned off third-party telemetry. HuggingFace usage reporting was on
+  by default and was never disabled (PR #4).
+
+- The knowledge-base directory is now created with `0700` permission (PR #4).
+
 - Added the ability to stop a reply while it is being generated (PR #3).
 
 - `Ctrl-C` on `uv run webapp` now cancels every live turn on the way out

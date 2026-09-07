@@ -13,6 +13,8 @@ Subcommands:
   clear             Delete all documents (prompts for confirmation)
   set-meta <source> Set verified title/authors/doi
 
+  server            Run the knowledge-base server (the webapp and jarvis-sync need it)
+
   index-vault       Incrementally update vault index; --force clears first
   reindex           Re-embed all chunks with the configured embed_model
   doctor            Diagnose knowledge base health (embed model, corruption)
@@ -39,6 +41,7 @@ Usage examples:
   uv run kb index-vault --force
   uv run kb reindex
   uv run kb doctor
+  uv run kb server
   uv run kb models
 """
 
@@ -47,6 +50,7 @@ import sys
 from pathlib import Path
 
 from jarvis.digest.import_digest import cmd_add_digest
+from jarvis.kb.store import allow_direct_index_access
 from jarvis.sync.status import cmd_sync_status
 
 
@@ -576,11 +580,31 @@ def cmd_reindex(args: "argparse.Namespace | None" = None) -> None:
     cfg = get_config()
     reindex_name = f"{COLLECTION_NAME}_reindex"
 
-    client = chromadb.PersistentClient(path=str(cfg.rag_dir))
+    # Go through the server when it is running: it owns the index, and two
+    # processes writing these files at once is what the write lock exists to
+    # prevent. With the server down we own them for the length of this command.
+    from .store import _server_client
+
+    try:
+        client = _server_client(cfg.server_port)
+        server_running = True
+        print(f"Reindexing through the knowledge-base server on port {cfg.server_port}.")
+    except Exception:
+        client = chromadb.PersistentClient(path=str(cfg.rag_dir))
+        server_running = False
 
     # Tolerate being called without parsed args (tests, and any programmatic
     # caller that just wants the ordinary rebuild).
     if getattr(args, "from_storage", False):
+        # Reading chroma.sqlite3 behind the server's back would race whatever
+        # it is doing with the same file. Say so plainly instead.
+        if server_running:
+            print(
+                "✗ The knowledge-base server is running and has the index open.\n"
+                "  Stop it first (Ctrl-C in its terminal), then re-run this.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
         # Recovery path: the vector index is too damaged to read through, so
         # take the chunks from SQLite instead. See _chunks_from_sqlite.
         print("Reading chunks directly from storage (bypassing the vector index)...", flush=True)
@@ -644,6 +668,59 @@ def cmd_reindex(args: "argparse.Namespace | None" = None) -> None:
         "NOTE: the swap gives the collection a new identity, so any jarvis "
         "process that was already running (the webapp or jarvis-sync) "
         "now holds a stale handle — restart those processes before using them."
+    )
+
+
+def cmd_server(args: argparse.Namespace) -> None:
+    """
+    Run the knowledge-base server in the foreground.
+
+    One process owns the index and everything else connects to it, which is
+    what stops a long-lived reader (the webapp, jarvis-sync) holding a cached
+    copy of the vector index while another process rewrites it underneath.
+
+    Bound to 127.0.0.1, never a routable address: the index holds the full
+    text of private notes and Chroma's server has no authentication, so being
+    unreachable from outside this machine is the protection. That is why the
+    host is fixed here rather than read from config.
+
+    Runs in the foreground like jarvis-sync, so it belongs in tmux or its own
+    terminal, and Ctrl-C stops it.
+    """
+    import os
+    import shutil
+
+    from jarvis.core.config import get_config
+
+    cfg = get_config()
+    cfg.rag_dir.mkdir(parents=True, exist_ok=True)
+    # Same owner-only treatment the store applies, so starting the server on a
+    # fresh machine does not leave private note text world-readable.
+    os.chmod(cfg.rag_dir, 0o700)
+
+    chroma = shutil.which("chroma")
+    if chroma is None:
+        print(
+            "✗ The 'chroma' command is not on PATH.\n"
+            "  It ships with the chromadb dependency — try: uv sync",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    print(f"Knowledge-base server on 127.0.0.1:{cfg.server_port}  (index: {cfg.rag_dir})")
+    print("The webapp and jarvis-sync need this running. Ctrl-C to stop.\n", flush=True)
+
+    # execv rather than a subprocess: this command has nothing left to do, and
+    # handing the terminal straight to the server means Ctrl-C and exit codes
+    # behave the way they would if it had been run directly.
+    os.execv(
+        chroma,
+        [
+            chroma, "run",
+            "--path", str(cfg.rag_dir),
+            "--host", "127.0.0.1",
+            "--port", str(cfg.server_port),
+        ],
     )
 
 
@@ -755,8 +832,18 @@ import json
 from jarvis.core.errors import KBCorruptionError, RAGError
 from jarvis.kb.store import count, get_store, search
 
-result = {"opened": False, "count": None, "search_ok": None, "error": None}
+result = {"opened": False, "count": None, "search_ok": None, "error": None,
+          "via_server": None}
 try:
+    from jarvis.core.config import get_config
+    from jarvis.kb.store import _server_client, allow_direct_index_access
+    try:
+        _server_client(get_config().server_port)
+        result["via_server"] = True
+    except Exception:
+        result["via_server"] = False
+    # Doctor has to work when the server is the broken thing.
+    allow_direct_index_access()
     store = get_store()
     result["opened"] = True
     result["count"] = count(store)
@@ -831,6 +918,14 @@ def cmd_doctor() -> None:
         print(f"✗ Failed to open store: {result['error']}", file=sys.stderr)
         sys.exit(1)
     print("✓ Store opened (embedding model matches)")
+    # Which way this reached the index is the first thing worth knowing when
+    # the chat is failing but the CLI is fine — they are different processes
+    # reaching the same data by different routes.
+    if result.get("via_server"):
+        print("✓ Knowledge-base server is running (the webapp and jarvis-sync use it)")
+    elif result.get("via_server") is False:
+        print("• Knowledge-base server is NOT running — checked the index files directly.\n"
+              "  The webapp and jarvis-sync need it: uv run kb server")
 
     print(f"✓ {result['count']} chunk(s) indexed")
     if not result["count"]:
@@ -1025,10 +1120,23 @@ def main() -> None:
     p_schema = sub.add_parser("schema", help="Show which metadata keys and values exist in the store")
     p_schema.add_argument("key", nargs="?", help="Show the distinct values of one key")
 
+    # server
+    sub.add_parser(
+        "server",
+        help="Run the knowledge-base server on 127.0.0.1 (the webapp and jarvis-sync need it)",
+    )
+
     # sync-status
     sub.add_parser("sync-status", help="Show jarvis-sync daemon health and last job outcomes")
 
     args = parser.parse_args()
+
+    # Every kb command is one-shot: it does its work and exits. That is what
+    # makes it safe to open the index files directly when the server is not
+    # running — and it keeps `kb doctor` usable at exactly the moment the
+    # server is the thing that is broken.
+    allow_direct_index_access()
+
     dispatch = {
         "add":         lambda: cmd_add(args),
         "add-digest":  lambda: cmd_add_digest(args),
@@ -1045,6 +1153,7 @@ def main() -> None:
         "schema":      lambda: cmd_schema(args),
         "drafts":      lambda: cmd_drafts(args),
         "sync-status": cmd_sync_status,
+        "server":      lambda: cmd_server(args),
     }
     dispatch[args.command]()
 
