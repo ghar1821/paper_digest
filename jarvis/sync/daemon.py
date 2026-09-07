@@ -629,9 +629,18 @@ def main() -> None:
     # shouldn't stall for a model download, and an embedding-model mismatch
     # should kill the daemon loudly at startup, not mid-job.
     log.info("loading knowledge base (embedding model)...")
+    from jarvis.core.errors import RAGError
     from jarvis.kb.store import get_store
 
-    get_store()
+    try:
+        get_store()
+    except RAGError as exc:
+        # The daemon is a long-lived reader and writer, so it connects to the
+        # knowledge-base server rather than opening the index itself. Dying
+        # here with the fix is better than starting up and failing every job.
+        log.error("cannot start: %s", exc)
+        print(f"\n✗ jarvis-sync cannot start.\n{exc}\n", file=sys.stderr)
+        sys.exit(1)
     log.info("knowledge base ready")
 
     from apscheduler.events import EVENT_JOB_ERROR, EVENT_JOB_EXECUTED

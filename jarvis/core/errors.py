@@ -26,12 +26,18 @@ class RAGError(PaperDigestError):
 
 class KBCorruptionError(RAGError):
     """
-    Raised when ChromaDB's HNSW index references a chunk id that no longer
-    exists — a corrupted index, not a transient failure. Surfaces as
-    "Error finding id" from similarity_search(). The fix is always the same
-    (uv run kb reindex, which re-embeds from the chunk texts already stored,
-    so nothing is lost) — no retry, because retrying a persistent corruption
-    just hides it (fail visibly, per CLAUDE.md).
+    Raised when the knowledge-base index cannot resolve a chunk id it holds a
+    reference to ("Error finding id"), or still names a collection that was
+    replaced by `kb reindex`.
+
+    Historically this was diagnosed as on-disk corruption. That was wrong: the
+    usual cause was a process holding a cached copy of the vector index while
+    another process rewrote it, which a restart cleared and no rebuild could
+    fix. The knowledge-base server owns the index now, so a reader cannot hold
+    a stale copy — which is what makes the remaining cases worth reporting.
+
+    Not retried: both describe persistent state that a retry would only hide
+    (fail visibly, per CLAUDE.md). `kb doctor` says which case it is.
     """
 
 

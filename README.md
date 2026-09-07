@@ -109,9 +109,19 @@ means `openrouter_model` was never set.
 
 ### 5. Run it
 
+Two processes, each in its own terminal (or a tmux pane):
+
 ```bash
+uv run kb server     # the knowledge base — must be running first
 uv run webapp        # browser at http://127.0.0.1:8080 (localhost only)
 ```
+
+`kb server` owns the search index, and the webapp connects to it. 
+The split is deliberate so no process caches a copy of the index and goes out of 
+sync if notes are edited.
+The webapp will refuse to start if the kb server does not start.
+
+Note: any `kb` commands don't need this server as they read the index directly.
 
 ---
 
@@ -335,7 +345,8 @@ uv run jarvis-sync
 
 Optional. It's a scheduler that runs the same vault sync, PDF sweep and draft
 cleanup you can run by hand, just on a timer. Skip it and you index manually
-after editing your notes. It logs to `~/.jarvis/logs/sync.log` and to the
+after editing your notes. It needs `kb server` running, for the same reason the
+webapp does — it writes to the index the chat is reading. It logs to `~/.jarvis/logs/sync.log` and to the
 terminal, and stays in the foreground, so run it under `tmux` or `screen` if
 you want it to survive closing the terminal. It won't start Ollama for you.
 
@@ -352,7 +363,12 @@ changed.
 | Edited, added or deleted notes | `kb index-vault` |
 | Want a clean rebuild of the note index | `kb index-vault --force` |
 | Changed `embed_model` in the config | `kb reindex` |
-| `kb doctor` reported a corrupt index | `kb reindex` (or `--from-storage`) |
+| Chat says the index can't resolve an id | `kb doctor` first — it says whether a rebuild is needed |
+| `kb doctor` reported missing ids | `kb reindex` (or `--from-storage`, with `kb server` stopped) |
+
+After `kb reindex` the collection is a new one, so anything already connected —
+the webapp, `jarvis-sync` — is still pointing at the old one and needs a
+restart. It says so when it finishes.
 
 ---
 
@@ -377,6 +393,7 @@ asleep, it catches up automatically. Run one by hand with
 
 ```bash
 # Everyday
+uv run kb server               # the knowledge base (webapp and sync need it)
 uv run webapp                  # the UI
 uv run jarvis-sync             # background sync
 
